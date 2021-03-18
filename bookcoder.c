@@ -60,6 +60,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <sys/stat.h>
 
 typedef uint32_t uoffset_t;
 typedef int32_t offset_t;
@@ -168,17 +169,18 @@ int fwriteWErrCheck(void *ptr, size_t size, size_t nmemb, FILE *stream, int *ret
 
 int getBufSizeMultiple(char *value) { 
     
-    char valString[11] = {0};
+    #define MAX_DIGITS 13
+    char valString[MAX_DIGITS] = {0};
     /* Compiling without optimization results in extremely slow speeds, but this will be optimized 
      * out if not set to volatile.
      */
     volatile int valueLength = 0;
-    int multiple = 1;
+    volatile int multiple = 1;
     
     /* value from getsubopt is not null-terminated so must copy and get the length manually without
      * string functions
      */
-    for(valueLength = 0;11;valueLength++) {
+    for(valueLength = 0;valueLength < MAX_DIGITS;valueLength++) {
         if(isdigit(value[valueLength])) {
             valString[valueLength] = value[valueLength];
             continue;
@@ -572,7 +574,7 @@ struct optionsStruct *optSt
                         }
                         
                         optSt->orgFilBufSizeGiven = true;
-                        orgFilSt->orgFilBufSize = atoi(value) * sizeof(byte_t) * getBufSizeMultiple(value);
+                        orgFilSt->orgFilBufSize = atol(value) * sizeof(byte_t) * getBufSizeMultiple(value);
                     break;
                     case BOOK_FILE_BUFFER:
                         if (value == NULL) {
@@ -586,7 +588,7 @@ struct optionsStruct *optSt
                         }
                             
                         optSt->bkFilBufSizeGiven = true;
-                        bkFilSt->bkFilBufSize = atoi(value) * sizeof(byte_t) * getBufSizeMultiple(value);
+                        bkFilSt->bkFilBufSize = atol(value) * sizeof(byte_t) * getBufSizeMultiple(value);
                     break;
                     case BKCD_FILE_BUFFER:
                         if (value == NULL) {
@@ -604,7 +606,7 @@ struct optionsStruct *optSt
                         
                         /*Divide the amount specified by the size of the byte offste since it will 
                          * be multipled later*/
-                        bkCdSt->bkCdBufSize = (atoi(value) * getBufSizeMultiple(value)) / sizeof(oSetSt->byteOffset);
+                        bkCdSt->bkCdBufSize = (atol(value) * getBufSizeMultiple(value)) / sizeof(oSetSt->byteOffset);
                     break;
                     case EXTR_FILE_BUFFER:
                         if (value == NULL) {
@@ -618,7 +620,7 @@ struct optionsStruct *optSt
                         }
 
                         optSt->extrFilBufSizeGiven = true;
-                        extrFilSt->extrFilBufSize = atoi(value) * sizeof(byte_t) * getBufSizeMultiple(value);
+                        extrFilSt->extrFilBufSize = atol(value) * sizeof(byte_t) * getBufSizeMultiple(value);
                     break;
                     default:
                         fprintf(stderr, "No match found for token: /%s/\n", value);
@@ -697,6 +699,44 @@ struct optionsStruct *optSt
     }
 }
 
+size_t bytesOfRamAvailable(void) {
+    FILE *meminfoFile = fopen("/proc/meminfo", "r");
+    if(meminfoFile == NULL) {
+        PRINT_FILE_ERROR("/proc/meminfo",errno);
+        exit(EXIT_FAILURE);
+    }
+
+    char meminfoLine[256];
+    while(fgets(meminfoLine, sizeof(meminfoLine), meminfoFile))
+    {
+        size_t availableMemory;
+        if(sscanf(meminfoLine, "MemAvailable: %lu kB", &availableMemory) == 1)
+        {
+            fclose(meminfoFile);
+            return availableMemory * 1024;
+        }
+    }
+
+    fclose(meminfoFile);
+    
+    printf("Could not read available system memory\n");
+    
+    exit(EXIT_FAILURE);
+    
+}
+
+size_t getFileSize(const char *filename)
+{
+    struct stat st;
+    
+    if(stat(filename, &st) == -1) {
+        PRINT_SYS_ERROR(errno);
+        exit(EXIT_FAILURE);
+    }
+    
+    return st.st_size;
+}
+
 int main(int argc, char *argv[])
 {
     
@@ -766,13 +806,8 @@ int main(int argc, char *argv[])
         }
 
         /*Get File Sizes*/
-        fseek(orgFilSt.orgFil, 0L, SEEK_END);
-        orgFilSt.orgFilSize = ftell(orgFilSt.orgFil);
-        rewind(orgFilSt.orgFil);
-
-        fseek(bkFilSt.bkFil, 0L, SEEK_END);
-        bkFilSt.bkFilSize = ftell(bkFilSt.bkFil);
-        rewind(bkFilSt.bkFil);
+        orgFilSt.orgFilSize = getFileSize(orgFilSt.orgFilName);        
+        bkFilSt.bkFilSize = getFileSize(bkFilSt.bkFilName);
         
         /*Set buffer sizes*/
         if(!optSt.bkFilBufSizeGiven)
@@ -798,13 +833,19 @@ int main(int argc, char *argv[])
             fprintf(stderr,"book_file_buffer %lu bytes\noriginal_file_buffer %lu bytes\n", (uint64_t)bkFilSt.bkFilBufSize, (uint64_t)orgFilSt.orgFilBufSize);
         }
         
+        /*Check available memory*/
+        if((orgFilSt.orgFilBufSize + bkFilSt.bkFilBufSize) > bytesOfRamAvailable()) {
+            printf("Not enough available memory for specified buffer size\n");
+            exit(EXIT_FAILURE);
+        }
+        
         /*Allocate buffers*/
         bkFilSt.bkFilBuffer = malloc(bkFilSt.bkFilBufSize);
         if (bkFilSt.bkFilBuffer == NULL) {
             PRINT_SYS_ERROR(errno);
             exit(EXIT_FAILURE);
         }
-    
+        
         orgFilSt.orgFilBuffer = malloc(orgFilSt.orgFilBufSize);
         if (orgFilSt.orgFilBuffer == NULL) {
             PRINT_SYS_ERROR(errno);
@@ -867,9 +908,7 @@ int main(int argc, char *argv[])
         }
 
         /*Get file sizes*/
-        fseek(bkCdSt.bkCd, 0L, SEEK_END);
-        bkCdSt.bkCdSize = ftell(bkCdSt.bkCd);
-        rewind(bkCdSt.bkCd);
+        bkCdSt.bkCdSize = getFileSize(bkFilSt.bkFilName);
         
         /*Set buffer sizes*/
         if(!optSt.extrFilBufSizeGiven)
@@ -894,6 +933,12 @@ int main(int argc, char *argv[])
         
         if(optSt.verbosityLevel >= 1) {
             fprintf(stderr,"extracted_file_buffer %lu bytes\nbook_code_buffer %lu bytes\n", (uint64_t)extrFilSt.extrFilBufSize, (uint64_t)bkCdSt.bkCdBufSize);
+        }
+        
+        /*Check available memory*/
+        if((bkCdSt.bkCdBufSize + extrFilSt.extrFilBufSize) > bytesOfRamAvailable()) {
+            printf("Not enough available memory for specified buffer size\n");
+            exit(EXIT_FAILURE);
         }
         
         /*Allocate buffers*/
